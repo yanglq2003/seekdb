@@ -54,6 +54,8 @@ public:
   virtual ~ObSelectResolver();
 
   virtual int resolve(const ParseNode &parse_tree);
+  int resolve_file_copy_options(const ParseNode &node, ObSelectIntoItem &item);
+  int resolve_file_describe(const ParseNode &parse_tree);
   ObSelectStmt *get_select_stmt();
   void set_calc_found_rows(bool found_rows) { has_calc_found_rows_ = found_rows; }
   void set_has_top_limit(bool has_top_limit) {has_top_limit_ = has_top_limit; }

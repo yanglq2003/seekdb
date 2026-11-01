@@ -10,6 +10,7 @@
  * limitations under the License.
  */
 #include "file_scan_reader.h"
+#include "file_scan_path.h"
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -48,7 +49,7 @@ bool utf8(const std::string &s)
   return true;
 }
 #ifndef _WIN32
-std::string identity(FILE *file)
+std::string file_identity(FILE *file)
 {
   struct stat s;
   if (fstat(fileno(file), &s) || !S_ISREG(s.st_mode)) return {};
@@ -71,7 +72,8 @@ bool CsvReader::open(const std::string &path, const std::string &root, const Csv
   if (path.find('\0') != std::string::npos || root.find('\0') != std::string::npos || root.empty()
       || lower(root) == "null") return fail("secure_file_priv denies access");
   if (!options.delimiter || !options.quote || !options.escape || options.delimiter == options.quote
-      || options.delimiter == '\n' || options.delimiter == '\r' || !options.max_columns
+      || options.delimiter == '\n' || options.delimiter == '\r' || options.quote == '\n' || options.quote == '\r'
+      || options.escape == '\n' || options.escape == '\r' || !options.max_columns
       || !options.max_record_bytes) return fail("invalid CSV options");
 #ifdef _WIN32
   return fail("secure file scanner requires POSIX descriptor support");
@@ -84,7 +86,7 @@ bool CsvReader::open(const std::string &path, const std::string &root, const Csv
     if (path.compare(0, prefix.size(), prefix)) return fail("path is outside secure_file_priv");
     relative = path.substr(prefix.size());
   }
-  int descriptor = ::open(base.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  int descriptor = open_canonical_directory(base);
   if (descriptor < 0) return fail("cannot open secure directory");
   size_t start = 0;
   while (descriptor >= 0) {
@@ -100,7 +102,7 @@ bool CsvReader::open(const std::string &path, const std::string &root, const Csv
   if (descriptor < 0) return fail("cannot open file or symbolic link denied");
   file_ = fdopen(descriptor, "rb");
   if (!file_) { close(descriptor); return fail("cannot create file stream"); }
-  identity_ = identity(file_);
+  identity_ = file_identity(file_);
   if (identity_.empty()) { fclose(file_); file_ = nullptr; return fail("input must be a regular file"); }
   return true;
 #endif
@@ -110,8 +112,60 @@ bool CsvReader::unchanged()
 #ifdef _WIN32
   return false;
 #else
-  return file_ && identity(file_) == identity_ ? true : fail("file changed during query");
+  return file_ && file_identity(file_) == identity_ ? true : fail("file changed during query");
 #endif
+}
+bool CsvReader::seek_start()
+{
+  if (!file_ || !unchanged() || fseek(file_, 0, SEEK_SET)) return fail("cannot seek input");
+  line_ = 1;
+  unsigned char bom[3];
+  size_t bytes = fread(bom, 1, 3, file_);
+  if (bytes != 3 || bom[0] != 0xef || bom[1] != 0xbb || bom[2] != 0xbf) {
+    if (fseek(file_, 0, SEEK_SET)) return fail("cannot restore file position");
+  }
+  return true;
+}
+bool CsvReader::size(uint64_t &length)
+{
+  if (!file_ || !unchanged()) return false;
+  long position = ftell(file_);
+  if (position < 0 || fseek(file_, 0, SEEK_END)) return fail("cannot inspect file size");
+  long end = ftell(file_);
+  if (end < 0 || fseek(file_, position, SEEK_SET)) return fail("cannot restore file position");
+  length = static_cast<uint64_t>(end);
+  return true;
+}
+bool CsvReader::read_at(uint64_t offset, size_t length, std::string &bytes)
+{
+  uint64_t total = 0;
+  if (!size(total)) return false;
+  if (offset > total || length > total - offset || length > 64 * 1024 * 1024 || offset > LONG_MAX)
+    return fail("invalid file range or read budget exceeded");
+  if (fseek(file_, static_cast<long>(offset), SEEK_SET)) return fail("seek failed");
+  bytes.resize(length);
+  if (length && fread(&bytes[0], 1, length, file_) != length) return fail("short read");
+  return unchanged();
+}
+bool CsvReader::read_line(std::string &line, bool &end)
+{
+  line.clear(); end = false;
+  if (!file_ || !unchanged()) return false;
+  for (;;) {
+    int c = fgetc(file_);
+    if (c == EOF) {
+      if (ferror(file_)) return fail("read failed");
+      end = line.empty();
+      return unchanged();
+    }
+    if (c == '\n') {
+      ++line_;
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      return true;
+    }
+    if (line.size() >= options_.max_record_bytes) return fail("line size limit exceeded");
+    line.push_back(static_cast<char>(c));
+  }
 }
 bool CsvReader::record(std::vector<Cell> &row, bool &end)
 {
@@ -151,7 +205,9 @@ bool CsvReader::record(std::vector<Cell> &row, bool &end)
       } else {
         if (c == '\n') ++line_;
         // Normalize CRLF inside quoted fields to the same newline used outside quotes.
-        if (c == '\r') { int n = fgetc(file_); if (n != '\n' && n != EOF) ungetc(n, file_); c = '\n'; }
+        if (c == '\r') { int n = fgetc(file_); if (n != '\n' && n != EOF) ungetc(n, file_);
+          if (n == '\n' && ++bytes > options_.max_record_bytes) return fail("record size limit exceeded");
+          ++line_; c = '\n'; }
         field.push_back(static_cast<char>(c));
       }
     } else if (c == options_.delimiter) {
@@ -169,13 +225,16 @@ Type CsvReader::infer_type(const std::string &s)
 {
   if (lower(s) == "true" || lower(s) == "false") return Type::boolean;
   int64_t integer = 0;
-  auto parsed = std::from_chars(s.data(), s.data() + s.size(), integer);
+  const char *begin = s.data();
+  if (s.size() > 1 && s[0] == '+' && s[1] != '-') ++begin;
+  auto parsed = std::from_chars(begin, s.data() + s.size(), integer);
   if (parsed.ec == std::errc() && parsed.ptr == s.data() + s.size()) return Type::bigint;
   // Overflowing integer literals remain strings instead of losing integer precision.
-  if (s.find_first_of(".eE") != std::string::npos && !s.empty() && s.find_first_not_of("0123456789+-.eE") == std::string::npos) {
-    char *end = nullptr;
-    double value = strtod(s.c_str(), &end);
-    if (end == s.c_str() + s.size() && std::isfinite(value)) return Type::real;
+  if (s.find_first_of(".eE") != std::string::npos && !s.empty()
+      && s.find_first_not_of("0123456789+-.eE") == std::string::npos) {
+    double value = 0;
+    auto number = std::from_chars(begin, s.data() + s.size(), value, std::chars_format::general);
+    if (number.ec == std::errc() && number.ptr == s.data() + s.size() && std::isfinite(value)) return Type::real;
   }
   auto digits = [&](size_t at, size_t count) {
     int value = 0;
@@ -185,7 +244,7 @@ Type CsvReader::infer_type(const std::string &s)
     }
     return value;
   };
-  if (s.size() == 10 || s.size() == 19) {
+  if (s.size() == 10 || (s.size() >= 19 && s.size() <= 26)) {
     int year = digits(0, 4), month = digits(5, 2), day = digits(8, 2);
     const int days[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
     bool leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
@@ -193,7 +252,8 @@ Type CsvReader::infer_type(const std::string &s)
         && day >= 1 && day <= days[month] + (month == 2 && leap)) {
       if (s.size() == 10) return Type::date;
       int hour = digits(11, 2), minute = digits(14, 2), second = digits(17, 2);
-      if ((s[10] == ' ' || s[10] == 'T') && s[13] == ':' && s[16] == ':'
+      bool fraction = s.size() == 19 || (s.size() > 20 && s[19] == '.' && digits(20, s.size() - 20) >= 0);
+      if ((s[10] == ' ' || s[10] == 'T') && s[13] == ':' && s[16] == ':' && fraction
           && hour >= 0 && hour < 24 && minute >= 0 && minute < 60 && second >= 0 && second < 60)
         return Type::datetime;
     }
@@ -211,12 +271,11 @@ Type CsvReader::widen(Type a, Type b)
 bool CsvReader::infer()
 {
   if (!file_ || !unchanged()) return false;
-  if (fseek(file_, 0, SEEK_SET)) return fail("cannot rewind");
+  if (!seek_start()) return false;
   columns_.clear(); line_ = 1; inferred_ = false;
   std::vector<Cell> row; bool end = false;
   if (!record(row, end)) return false;
   if (end) return fail("empty file has no schema");
-  if (row[0].text.compare(0, 3, "\xef\xbb\xbf") == 0) row[0].text.erase(0, 3);
   std::set<std::string> names;
   for (size_t i = 0; i < row.size(); ++i) {
     std::string name = options_.header && !row[i].text.empty() ? row[i].text : "column" + std::to_string(i + 1);
@@ -229,13 +288,17 @@ bool CsvReader::infer()
     for (size_t i = 0; i < row.size(); ++i) {
       columns_[i].nullable = row[i].is_null;
       columns_[i].type = row[i].is_null ? Type::null_value : infer_type(row[i].text);
+      if (columns_[i].type == Type::datetime && row[i].text.size() > 20) columns_[i].scale = row[i].text.size() - 20;
     }
   }
   while (record(row, end) && !end) {
     if (row.size() != columns_.size()) return fail("field count differs from schema");
     for (size_t i = 0; i < row.size(); ++i) {
       columns_[i].nullable |= row[i].is_null;
-      columns_[i].type = widen(columns_[i].type, row[i].is_null ? Type::null_value : infer_type(row[i].text));
+      Type type = row[i].is_null ? Type::null_value : infer_type(row[i].text);
+      columns_[i].type = widen(columns_[i].type, type);
+      if (type == Type::datetime && row[i].text.size() > 20)
+        columns_[i].scale = std::max<unsigned>(columns_[i].scale, row[i].text.size() - 20);
     }
   }
   if (!error_.empty()) return false;
@@ -244,7 +307,7 @@ bool CsvReader::infer()
 }
 bool CsvReader::rewind()
 {
-  if (!file_ || !unchanged() || fseek(file_, 0, SEEK_SET)) return fail("cannot rescan changed file");
+  if (!seek_start()) return false;
   line_ = 1;
   if (options_.header) { std::vector<Cell> header; bool end; return record(header, end); }
   return true;

@@ -18,8 +18,8 @@
 namespace oceanbase { namespace sql { namespace file_sql {
 
 enum class Type { null_value, bigint, real, boolean, varchar, date, datetime };
-struct Cell { std::string text; bool is_null = false; };
-struct Column { std::string name; Type type = Type::null_value; bool nullable = false; };
+struct Cell { std::string text; bool is_null = false; Type declared_type = Type::null_value; };
+struct Column { std::string name; Type type = Type::null_value; bool nullable = false; unsigned scale = 0; };
 struct CsvOptions {
   bool header = true;
   char delimiter = ',';
@@ -42,6 +42,11 @@ public:
   bool next(std::vector<Cell> &row, bool &end);
   bool rewind();
   bool unchanged();
+  bool read_line(std::string &line, bool &end);
+  bool seek_start();
+  bool read_at(uint64_t offset, size_t length, std::string &bytes);
+  bool size(uint64_t &length);
+  const std::string &identity() const { return identity_; }
   const std::vector<Column> &columns() const { return columns_; }
   const std::string &error() const { return error_; }
   static Type infer_type(const std::string &text);
@@ -56,5 +61,74 @@ private:
   std::string identity_;
   size_t line_ = 1;
   bool inferred_ = false;
+};
+
+class JsonLineReader final {
+public:
+  const std::string &identity() const { return file_.identity(); }
+  bool open(const std::string &path, const std::string &secure_root);
+  bool infer();
+  bool next(std::vector<Cell> &row, bool &end);
+  bool rewind();
+  const std::vector<Column> &columns() const { return columns_; }
+  const std::string &error() const { return error_; }
+private:
+  bool object(std::vector<std::pair<std::string, Cell>> &fields, bool &end);
+  CsvReader file_;
+  std::vector<Column> columns_;
+  std::string error_;
+  size_t line_ = 0;
+  bool inferred_ = false;
+};
+
+class ParquetReader final {
+public:
+  const std::string &identity() const;
+  ParquetReader();
+  ~ParquetReader();
+  ParquetReader(const ParquetReader &) = delete;
+  ParquetReader &operator=(const ParquetReader &) = delete;
+  bool open(const std::string &path, const std::string &secure_root);
+  bool infer();
+  bool project(const std::vector<size_t> &columns);
+  bool next(std::vector<Cell> &row, bool &end);
+  bool rewind();
+  const std::vector<Column> &columns() const;
+  const std::string &error() const;
+private:
+  struct State;
+  State *state_;
+};
+class GlobReader final {
+public:
+  bool open(const std::string &pattern, const std::string &secure_root);
+  bool next(std::vector<Cell> &row, bool &end);
+  const std::vector<Column> &columns() const { return columns_; }
+  const std::string &error() const { return error_; }
+private:
+  std::vector<Column> columns_{{"file", Type::varchar, false}};
+  std::vector<std::string> paths_;
+  std::string error_;
+  size_t position_ = 0;
+};
+class AtomicCsvWriter final {
+public:
+  AtomicCsvWriter() = default;
+  ~AtomicCsvWriter();
+  AtomicCsvWriter(const AtomicCsvWriter &) = delete;
+  AtomicCsvWriter &operator=(const AtomicCsvWriter &) = delete;
+  bool open(const std::string &path, const std::string &secure_root, const CsvOptions &options,
+            const std::vector<std::string> &names);
+  bool append(const std::vector<Cell> &row);
+  bool finish();
+  const std::string &error() const { return error_; }
+private:
+  bool fail(const std::string &message);
+  FILE *file_ = nullptr;
+  int directory_ = -1;
+  std::string temporary_, target_, error_;
+  CsvOptions options_;
+  size_t columns_ = 0;
+  bool finished_ = false;
 };
 }}}

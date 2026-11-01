@@ -10975,5 +10975,18 @@
     "info_cn": "",
     "background_cn": "",
     "ref_url": ""
+  },
+  "enable_file_sql": {
+    "id": 10754,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Enable local file table functions and CSV COPY, subject to secure_file_priv.",
+    "flags": "GLOBAL | SESSION | NEED_SERIALIZE | INFLUENCE_PLAN",
+    "publish_version": "1400",
+    "info_cn": "启用受 secure_file_priv 限制的本地文件 SQL",
+    "background_cn": "本地只读文件查询开关，默认关闭",
+    "ref_url": ""
   }
 }

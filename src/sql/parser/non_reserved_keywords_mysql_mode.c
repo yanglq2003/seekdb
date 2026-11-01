@@ -27,6 +27,11 @@ static t_node *mysql_sql_keywords_in_pl_root = NULL;
  *The implementation does not need to guarantee lexicographical order, but it is still advisable to maintain lexicographical order for ease of maintenance and lookup.*/
 static const NonReservedKeyword Mysql_none_reserved_keywords[] =
 {
+  {"read_csv", FILE_SQL_READER},
+  {"read_json", FILE_SQL_READER},
+  {"read_ndjson", FILE_SQL_READER},
+  {"read_parquet", FILE_SQL_READER},
+  {"glob", FILE_SQL_READER},
   {"access", ACCESS},
   {"accessible", ACCESSIBLE},
   {"ai", AI},

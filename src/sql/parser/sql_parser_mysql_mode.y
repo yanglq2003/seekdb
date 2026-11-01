@@ -40,6 +40,16 @@
 #include "../../../src/sql/parser/sql_parser_mysql_mode_lex.h"
 #include "../../../src/sql/parser/sql_parser_base.h"
 
+static int file_sql_contains_source(const ParseNode *node, int depth)
+{
+  if (node == NULL || depth > 128) return 0;
+  if (node->type_ == T_FILE_TABLE_EXPRESSION) return 1;
+  for (int i = 0; i < node->num_child_; ++i) {
+    if (file_sql_contains_source(node->children_[i], depth + 1)) return 1;
+  }
+  return 0;
+}
+
 #define GEN_EXPLAN_STMT(no_use, explain_stmt, explain_type, display_type, stmt, into_table, set_statement_id) \
   (void)(no_use); \
   ParseNode *type_node = NULL; \
@@ -257,6 +267,7 @@ END_P SET_VAR DELIMITER
         ZEROFILL
 
 //-----------------------------reserved keyword end-------------------------------------------------
+%token <non_reserved_keyword> FILE_SQL_READER
 %token <non_reserved_keyword>
 //-----------------------------non_reserved keyword begin-------------------------------------------
         ACCESS ACCOUNT ACTION ACTIVE ADDDATE AFTER AGAINST AGGREGATE AI ALGORITHM ALWAYS ALLOW ANALYSE ANY
@@ -497,6 +508,8 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
+%type <node> file_sql_arguments file_sql_argument
+%type <node> file_sql_table_expr file_sql_call file_copy_stmt file_copy_source file_copy_options file_copy_list file_copy_option
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
@@ -556,6 +569,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | file_copy_stmt          { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -10831,6 +10845,8 @@ tbl_name
   unname_node->sql_str_off_ = @2.first_column;
   $$->value_ = 1; //lateral
 }
+| file_sql_table_expr
+{ $$ = $1; }
 | json_table_expr
 {
   $$ = $1;
@@ -12265,7 +12281,13 @@ explain_or_desc relation_factor opt_desc_column_option
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $2, NULL, $3);
 }
 
-| explain_or_desc explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);}
+| explain_or_desc explainable_stmt
+{
+  if ($1 != NULL && $2->type_ == T_SELECT && file_sql_contains_source($2, 0)) {
+    $$ = $2;
+    $$->is_file_describe_ = 1;
+  } else { GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL); }
+}
 | explain_or_desc PRETTY explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY, $3, NULL, NULL);}
 | explain_or_desc PRETTY_COLOR explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY_COLOR, $3, NULL, NULL);}
 
@@ -12306,8 +12328,8 @@ explain_or_desc relation_factor opt_desc_column_option
 
 explain_or_desc:
 EXPLAIN {$$ = NULL;}
-| DESCRIBE {$$ = NULL;}
-| DESC  {$$ = NULL;}
+| DESCRIBE { malloc_terminal_node($$, result->malloc_pool_, T_INT); $$->value_ = 1; }
+| DESC  { malloc_terminal_node($$, result->malloc_pool_, T_INT); $$->value_ = 1; }
 ;
 
 explainable_stmt:
@@ -17428,6 +17450,78 @@ JSON '(' column_name ')' STORE AS '(' lob_storage_parameters ')'
 }
 ;
 
+file_copy_stmt:
+COPY file_copy_source TO STRING_VALUE file_copy_options
+{
+  $$ = $2;
+  if ($$->children_[PARSE_SELECT_INTO] != NULL || $$->children_[PARSE_SELECT_INTO_EXTRA] != NULL) {
+    yyerror(&@1, result, "COPY source cannot contain INTO"); YYERROR;
+  }
+  ParseNode *into = NULL;
+  malloc_non_terminal_node(into, result->malloc_pool_, T_INTO_OUTFILE, 5, $4, NULL, NULL, NULL, $5);
+  into->is_file_copy_ = 1;
+  into->is_tree_not_param_ = 1;
+  $$->children_[PARSE_SELECT_INTO_EXTRA] = into;
+}
+;
+file_copy_source:
+select_with_parens { $$ = $1; }
+| relation_factor
+{
+  ParseNode *star = NULL, *projection = NULL, *project_list = NULL, *table = NULL, *from = NULL;
+  malloc_terminal_node(star, result->malloc_pool_, T_STAR);
+  malloc_non_terminal_node(projection, result->malloc_pool_, T_PROJECT_STRING, 1, star);
+  dup_string_to_node(projection, result->malloc_pool_, "*");
+  merge_nodes(project_list, result, T_PROJECT_LIST, projection);
+  malloc_non_terminal_node(table, result->malloc_pool_, T_ORG, 4, $1, NULL, NULL, NULL);
+  merge_nodes(from, result, T_FROM_LIST, table);
+  malloc_select_node($$, result->malloc_pool_);
+  $$->children_[PARSE_SELECT_SELECT] = project_list;
+  $$->children_[PARSE_SELECT_FROM] = from;
+}
+;
+file_copy_options:
+/* EMPTY */ { $$ = NULL; }
+| '(' file_copy_list ')' { merge_nodes($$, result, T_EXPR_LIST, $2); }
+;
+file_copy_list:
+file_copy_option { $$ = $1; }
+| file_copy_list ',' file_copy_option { malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3); }
+;
+file_copy_option:
+relation_name { malloc_non_terminal_node($$, result->malloc_pool_, T_ARGUMENT_LIST, 2, $1, NULL); }
+| relation_name literal { malloc_non_terminal_node($$, result->malloc_pool_, T_ARGUMENT_LIST, 2, $1, $2); }
+| relation_name relation_name { malloc_non_terminal_node($$, result->malloc_pool_, T_ARGUMENT_LIST, 2, $1, $2); }
+| relation_name COMP_EQ literal { malloc_non_terminal_node($$, result->malloc_pool_, T_ARGUMENT_LIST, 2, $1, $3); }
+;
+
+file_sql_table_expr:
+file_sql_call %prec LOWER_PARENS { $$ = $1; }
+| file_sql_call relation_name { $$ = $1; $$->children_[2] = $2; }
+| file_sql_call AS relation_name { $$ = $1; $$->children_[2] = $3; }
+;
+
+file_sql_arguments:
+file_sql_argument { malloc_list_node($$, result->malloc_pool_, T_EXPR_LIST, 2, 1, $1); }
+| file_sql_arguments ',' file_sql_argument { push_back_list(result->malloc_pool_, result, $$, $1, $3); }
+;
+file_sql_argument:
+simple_expr { $$ = $1; }
+| column_name COMP_EQ simple_expr { malloc_non_terminal_node($$, result->malloc_pool_, T_OP_EQ, 2, $1, $3); }
+;
+
+file_sql_call:
+FILE_SQL_READER '(' file_sql_arguments ')'
+{
+  ParseNode *name = NULL;
+  ParseNode *args = NULL;
+  make_name_node(name, result->malloc_pool_, $1->keyword_name);
+  args = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, name, args, NULL);
+  $$->is_tree_not_param_ = 1;
+}
+;
+
 unnest_expr:
 UNNEST '(' simple_expr_list ')' 
 {
@@ -17491,7 +17585,8 @@ unreserved_keyword_normal { $$=$1;}
 ;
 
 unreserved_keyword_normal:
-ACCOUNT
+FILE_SQL_READER
+| ACCOUNT
 |       ACTION
 |       ACTIVE
 |       ADDDATE

@@ -422,6 +422,10 @@ SQL_COMPOSITION_HEADERS = [
 ]
 
 SQL_PRIVATE_HEADERS = [
+    "engine/basic/file_scan_reader.h",
+    "engine/basic/file_scan_path.h",
+    "engine/basic/file_scan_parquet_codec.h",
+    "engine/basic/file_sql_config.h",
     "code_generator/ob_code_generator.h",
     "code_generator/ob_dml_cg_service.h",
     "code_generator/ob_static_engine_cg.h",

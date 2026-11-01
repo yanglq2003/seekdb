@@ -116,7 +116,7 @@ struct SelectItem
 struct ObSelectIntoItem
 {
   ObSelectIntoItem()
-      : into_type_(),
+      : is_file_copy_(false), into_type_(),
         outfile_name_(),
         field_str_(),
         line_str_(),
@@ -143,6 +143,7 @@ struct ObSelectIntoItem
     cs_type_ = ObCharset::get_system_collation();
   }
   int assign(const ObSelectIntoItem &other) {
+    is_file_copy_ = other.is_file_copy_;
     into_type_ = other.into_type_;
     outfile_name_ = other.outfile_name_;
     field_str_ = other.field_str_;
@@ -172,6 +173,7 @@ struct ObSelectIntoItem
                K_(cs_type),
                K_(buffer_size),
                K_(external_properties));
+  bool is_file_copy_;
   ObItemType into_type_;
   common::ObObj outfile_name_;
   common::ObObj field_str_; // field terminated str
